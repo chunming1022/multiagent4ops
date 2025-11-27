@@ -4,9 +4,9 @@ from autogen_ext.models.openai import OpenAIChatCompletionClient
 
 # ------------------ 智能体配置 ------------------
 model_client = OpenAIChatCompletionClient(
-    model="qwen-flash",
-    base_url="https://dashscope.aliyuncs.com/compatible-mode/v1",
-    api_key="sk-bd079ff734ab441fabe1dd900bdd9934",
+    model="",
+    base_url="",
+    api_key="",
     parallel_tool_calls=False,
     model_info={
         "vision": False,
@@ -318,4 +318,5 @@ judge_agent = AssistantAgent(
 #                 ]
 #             }} 
 #     """
+
 # )
