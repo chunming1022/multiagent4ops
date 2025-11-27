@@ -216,7 +216,7 @@ def _analyze_status_combinations_in_fault_period(df_filtered_traces: pd.DataFram
     
     if len(status_logs) == 0:
         print("故障期间没有包含status的记录")
-        return ""
+        return None
     
     print(f"故障期间找到 {len(status_logs)} 条包含status的记录")
     
@@ -264,9 +264,9 @@ def _analyze_status_combinations_in_fault_period(df_filtered_traces: pd.DataFram
                 'operation_name': operation_name
             })
     
-    if not status_details:
+    if len(status_details) == 0:
         print("没有找到非正常的status组合")
-        return ""
+        return None
     
     # 转换为DataFrame
     status_df = pd.DataFrame(status_details)
@@ -276,21 +276,21 @@ def _analyze_status_combinations_in_fault_period(df_filtered_traces: pd.DataFram
                           'operation_name', 'status_code', 'status_message']
     
     # 分组统计
-    grouped = status_df.groupby(combination_columns).size().reset_index(name='occurrence_count')
+    grouped = status_df.groupby(combination_columns).size().reset_index(name='anomaly_count')
     
     # 按出现次数降序排列，取前20个（在添加文字之前排序）
-    grouped = grouped.sort_values('occurrence_count', ascending=False).head(20)
+    grouped = grouped.sort_values('anomaly_count', ascending=False).head(20)
     
     # 添加文字描述到次数列
-    grouped['occurrence_count_display'] = grouped['occurrence_count'].apply(lambda x: f"出现次数:{x}")
+    grouped['anomaly_count_display'] = grouped['anomaly_count'].apply(lambda x: f"出现次数:{x}")
     
     # 删除原始数字列，重命名显示列
-    grouped = grouped.drop('occurrence_count', axis=1)
-    grouped = grouped.rename(columns={'occurrence_count_display': 'occurrence_count'})
+    grouped = grouped.drop('anomaly_count', axis=1)
+    grouped = grouped.rename(columns={'anomaly_count_display': 'anomaly_count'})
     
     # 调整列顺序为指定的顺序
     desired_column_order = ['node_name', 'service_name', 'parent_pod', 'child_pod', 
-                           'operation_name', 'status_code', 'status_message', 'occurrence_count']
+                           'operation_name', 'status_message', 'anomaly_count']
     
     # 确保只包含存在的列，并按指定顺序排列
     existing_columns = [col for col in desired_column_order if col in grouped.columns]
@@ -298,7 +298,7 @@ def _analyze_status_combinations_in_fault_period(df_filtered_traces: pd.DataFram
     
     print(f"找到 {len(grouped)} 种不同的status组合（包含上下文信息，显示前20个）")
     
-    return grouped.to_csv(index=False)
+    return grouped
 
 
 def _sample_timestamp_data(sample_size: int = 50, random_seed: int = 42) -> pd.DataFrame:
@@ -434,17 +434,16 @@ def _extract_normal_traces(sampled_df: pd.DataFrame, merged_df: pd.DataFrame, mi
         print(f"找到 {len(normal_df)} 条正常时期的数据")
         
         # 按parent_pod, child_pod, operationName分组
-        trace_gp = normal_df.groupby(['parent_pod', 'child_pod', 'node_name','operationName'])
+        trace_gp = normal_df.groupby(['parent_pod', 'child_pod', 'operationName'])
         
         # 遍历每个组，构建字典
-        for (src, dst, node_name, op), call_df in trace_gp:
+        for (src, dst, op), call_df in trace_gp:
             # 处理None值
             src_str = str(src) if src is not None else "None"
             dst_str = str(dst) if dst is not None else "None"
-            node_name_str = str(node_name) if node_name is not None else "None"
             op_str = str(op) if op is not None else "None"
             
-            name = f"{src_str}_{dst_str}_{node_name_str}_{op_str}"
+            name = f"{src_str}_{dst_str}_{op_str}"
             normal_traces[name].append(call_df)
             print(f"添加组 {name}: {len(call_df)} 条数据")
     
@@ -600,10 +599,9 @@ def _detect_anomalies(df: pd.DataFrame, trace_detectors: Dict[str, Dict[str, Iso
         # 处理None值
         parent_pod_str = str(parent_pod) if parent_pod is not None else "None"
         child_pod_str = str(child_pod) if child_pod is not None else "None"
-        node_name_str = str(node_name) if node_name is not None else "None"
         operation_name_str = str(operation_name) if operation_name is not None else "None"
         
-        name = f"{parent_pod_str}_{child_pod_str}_{node_name_str}_{operation_name_str}"
+        name = f"{parent_pod_str}_{child_pod_str}_{operation_name_str}"
         
         # 检查是否有对应的检测器
         if name not in trace_detectors:
@@ -775,185 +773,194 @@ def trace_refinement(start_time_hour: str, start_time: int, end_time: int) -> tu
                 如果没有异常或出错则返回空字符串和空字典
     """
     # ========== 第一部分：异常检测器的预处理和训练（训练完成后可以注释掉以下几行） ==========
+    candidates = {
+        'candidate_nodes': [],
+        'candidate_services': [],
+        'candidate_pods': [],
+    }
     trace_detectors, normal_stats = _load_or_train_anomaly_detection_model()
     if trace_detectors is None:
         print("无法获取异常检测模型")
-        return "", {}, ""
+        return None, candidates, None
     
     # ========== 第二部分：单独的异常检测操作 ==========
     search_pattern = os.path.join(project_root, 'data', '*', 'trace-parquet', f'*{start_time_hour}*')
     matching_files = glob.glob(search_pattern, recursive=True)  
     
-    try:
-        if not matching_files:
-            print("未找到匹配的trace文件")
-            return "", {}, ""
-            
-        # 读取trace数据
-        df_trace = pd.read_parquet(matching_files[0])
-        print("原始trace行数：", len(df_trace))
+    if not matching_files:
+        print("未找到匹配的trace文件")
+        return None, candidates, None
         
-        # 过滤时间范围内的数据
-        df_filtered_traces = _filter_traces_by_timerange(start_time, end_time, df_trace)
+    # 读取trace数据
+    df_trace = pd.read_parquet(matching_files[0])
+    print("原始trace行数：", len(df_trace))
+    
+    # 过滤时间范围内的数据
+    df_filtered_traces = _filter_traces_by_timerange(start_time, end_time, df_trace)
+    
+    if df_filtered_traces is None or len(df_filtered_traces) == 0:
+        print("时间范围内没有trace数据")
+        return None, candidates, None
         
-        if df_filtered_traces is None or len(df_filtered_traces) == 0:
-            print("时间范围内没有trace数据")
-            return "", {}, ""
-            
-        print("过滤时间范围后的trace行数：", len(df_filtered_traces))
+    print("过滤时间范围后的trace行数：", len(df_filtered_traces))
+    
+    # 预处理trace数据
+    print("预处理trace数据...")
+    start_preprocess_time = time.time()
+    
+    # 提取pod_name, service_name, node_name
+    df_filtered_traces['pod_name'] = df_filtered_traces['process'].apply(_extract_pod_name)
+    df_filtered_traces['service_name'] = df_filtered_traces['process'].apply(_extract_service_name)
+    df_filtered_traces['node_name'] = df_filtered_traces['process'].apply(_extract_node_name)
+    
+    # 提取父spanID
+    df_filtered_traces['parent_spanID'] = df_filtered_traces['references'].apply(_extract_parent_spanid)
+    
+    # 创建spanID到pod_name的映射
+    span_to_pod = dict(zip(df_filtered_traces['spanID'].tolist(), df_filtered_traces['pod_name'].tolist()))
+    
+    # 提取父spanID对应的pod_name
+    df_filtered_traces['parent_pod'] = df_filtered_traces['parent_spanID'].map(lambda x: span_to_pod.get(x))
+    
+    # 重命名pod_name为child_pod
+    df_filtered_traces = df_filtered_traces.rename(columns={'pod_name': 'child_pod'})
+    
+    # 按时间戳排序
+    df_filtered_traces = df_filtered_traces.sort_values(by='timestamp_ns')
+    
+    end_preprocess_time = time.time()
+    print(f"预处理trace数据耗时: {end_preprocess_time - start_preprocess_time:.2f}秒")
+    
+    # 分析故障期间的status组合（在预处理完成后）
+    status_combinations = _analyze_status_combinations_in_fault_period(df_filtered_traces)
+    
+    # 检测异常
+    anomaly_events = _detect_anomalies(df_filtered_traces, trace_detectors)
+    
+    print(f"检测到 {len(anomaly_events)} 个异常事件")
+    
+    # 将异常事件转换为DataFrame格式
+    if len(anomaly_events) == 0:
+        if status_combinations is None:
+            return None, candidates, None
+        else:
+            return None, candidates, status_combinations.to_csv(index=False)
+    
+    anomaly_data = []
+    for event in anomaly_events:
+        timestamp, parent_pod, child_pod, operation_name, anomaly_type, duration, service_name, node_name = event
+        # 转换为北京时间 (UTC+8)
+        beijing_time = pd.to_datetime(timestamp, unit='ns') + pd.Timedelta(hours=BEIJING_TIMEZONE_OFFSET)
+        anomaly_data.append({
+            'timestamp': timestamp,
+            'timestamp_readable': beijing_time,
+            'parent_pod': parent_pod,
+            'child_pod': child_pod,
+            'operation_name': operation_name,
+            'anomaly_type': anomaly_type,
+            'duration': duration,
+            'service_name': service_name,
+            'node_name': node_name
+        })
+    
+    df_anomalies = pd.DataFrame(anomaly_data)
+    
+    # ========== 第三部分：统计前10个异常组合 ==========
+    # 按时间排序
+    df_anomalies = df_anomalies.sort_values('timestamp_readable')
+    
+    # 创建组合列
+    df_anomalies['combination'] = (df_anomalies['parent_pod'].astype(str) + '_' + 
+                                    df_anomalies['child_pod'].astype(str) + '_' + 
+                                    df_anomalies['node_name'].astype(str) + '_' +
+                                    df_anomalies['operation_name'].astype(str))
+    
+    # duration信息已经在异常检测时直接提取并包含在异常数据中，无需额外匹配
+    
+    # 按组合分组进行统计
+    combination_stats = []
+    
+    for combination_name, group in df_anomalies.groupby('combination'):
+        parent_pod = group['parent_pod'].iloc[0]
+        child_pod = group['child_pod'].iloc[0]
+        operation_name = group['operation_name'].iloc[0]
+        service_name = group['service_name'].iloc[0] if 'service_name' in group.columns else None
+        node_name = group['node_name'].iloc[0] if 'node_name' in group.columns else None
         
-        # 预处理trace数据
-        print("预处理trace数据...")
-        start_preprocess_time = time.time()
+        # 计算平均duration（如果有的话）
+        if 'duration' not in group.columns or len(group['duration'].dropna()) == 0:
+            continue  # 跳过没有有效duration数据的组合
+        anomaly_avg_duration = group['duration'].mean()
         
-        # 提取pod_name, service_name, node_name
-        df_filtered_traces['pod_name'] = df_filtered_traces['process'].apply(_extract_pod_name)
-        df_filtered_traces['service_name'] = df_filtered_traces['process'].apply(_extract_service_name)
-        df_filtered_traces['node_name'] = df_filtered_traces['process'].apply(_extract_node_name)
+        # 获取正常数据的平均时间
+        normal_avg_time = 0
+        combination_key = f"{parent_pod}_{child_pod}_{operation_name}"
+        if combination_key in normal_stats:
+            normal_avg_time = normal_stats[combination_key].get('mean', 0)
         
-        # 提取父spanID
-        df_filtered_traces['parent_spanID'] = df_filtered_traces['references'].apply(_extract_parent_spanid)
-        
-        # 创建spanID到pod_name的映射
-        span_to_pod = dict(zip(df_filtered_traces['spanID'].tolist(), df_filtered_traces['pod_name'].tolist()))
-        
-        # 提取父spanID对应的pod_name
-        df_filtered_traces['parent_pod'] = df_filtered_traces['parent_spanID'].map(lambda x: span_to_pod.get(x))
-        
-        # 重命名pod_name为child_pod
-        df_filtered_traces = df_filtered_traces.rename(columns={'pod_name': 'child_pod'})
-        
-        # 按时间戳排序
-        df_filtered_traces = df_filtered_traces.sort_values(by='timestamp_ns')
-        
-        end_preprocess_time = time.time()
-        print(f"预处理trace数据耗时: {end_preprocess_time - start_preprocess_time:.2f}秒")
-        
-        # 分析故障期间的status组合（在预处理完成后）
-        status_combinations_csv = _analyze_status_combinations_in_fault_period(df_filtered_traces)
-        
-        # 检测异常
-        anomaly_events = _detect_anomalies(df_filtered_traces, trace_detectors)
-        
-        print(f"检测到 {len(anomaly_events)} 个异常事件")
-        
-        # 将异常事件转换为DataFrame格式
-        if not anomaly_events:
-            return "", {}, status_combinations_csv
-        
-        anomaly_data = []
-        for event in anomaly_events:
-            timestamp, parent_pod, child_pod, operation_name, anomaly_type, duration, service_name, node_name = event
-            # 转换为北京时间 (UTC+8)
-            beijing_time = pd.to_datetime(timestamp, unit='ns') + pd.Timedelta(hours=BEIJING_TIMEZONE_OFFSET)
-            anomaly_data.append({
-                'timestamp': timestamp,
-                'timestamp_readable': beijing_time,
-                'parent_pod': parent_pod,
-                'child_pod': child_pod,
-                'operation_name': operation_name,
-                'anomaly_type': anomaly_type,
-                'duration': duration,
-                'service_name': service_name,
-                'node_name': node_name
-            })
-        
-        df_anomalies = pd.DataFrame(anomaly_data)
-        
-        # ========== 第三部分：统计前10个异常组合 ==========
-        # 按时间排序
-        df_anomalies = df_anomalies.sort_values('timestamp_readable')
-        
-        # 创建组合列
-        df_anomalies['combination'] = (df_anomalies['parent_pod'].astype(str) + '_' + 
-                                        df_anomalies['child_pod'].astype(str) + '_' + 
-                                        df_anomalies['node_name'].astype(str) + '_' +
-                                        df_anomalies['operation_name'].astype(str))
-        
-        # duration信息已经在异常检测时直接提取并包含在异常数据中，无需额外匹配
-        
-        # 按组合分组进行统计
-        combination_stats = []
-        
-        for combination_name, group in df_anomalies.groupby('combination'):
-            parent_pod = group['parent_pod'].iloc[0]
-            child_pod = group['child_pod'].iloc[0]
-            operation_name = group['operation_name'].iloc[0]
-            service_name = group['service_name'].iloc[0] if 'service_name' in group.columns else None
-            node_name = group['node_name'].iloc[0] if 'node_name' in group.columns else None
-            
-            # 计算平均duration（如果有的话）
-            if 'duration' not in group.columns or len(group['duration'].dropna()) == 0:
-                continue  # 跳过没有有效duration数据的组合
-            anomaly_avg_duration = group['duration'].mean()
-            
-            # 获取正常数据的平均时间
-            normal_avg_time = 0
-            combination_key = f"{parent_pod}_{child_pod}_{node_name}_{operation_name}"
-            if combination_key in normal_stats:
-                normal_avg_time = normal_stats[combination_key].get('mean', 0)
-            
-            stats = {
-                'node_name': node_name,
-                'service_name': service_name,
-                'parent_pod': parent_pod,
-                'child_pod': child_pod,
-                'operation_name': operation_name,
-                'normal_avg_duration': normal_avg_time,
-                'anomaly_avg_duration': anomaly_avg_duration,
-                'anomaly_count': len(group)
-            }
-            combination_stats.append(stats)
-        
-        # 转换为DataFrame并按出现次数排序，取前20个
-        if not combination_stats:
-            return "", {}, status_combinations_csv
-            
-        stats_df = pd.DataFrame(combination_stats)
-        
-
-        # 按出现次数排序，取前20个（在添加文字之前排序）
-        top_20_stats = stats_df.sort_values('anomaly_count', ascending=False).head(20)
-        
-        # 添加文字描述到anomaly_count列
-        top_20_stats['anomaly_count'] = top_20_stats['anomaly_count'].apply(lambda x: f"出现次数:{x}")
-        
-        # 重新排列列顺序
-        desired_column_order = ['node_name', 'service_name', 'parent_pod', 'child_pod', 
-                               'operation_name', 'normal_avg_duration', 'anomaly_avg_duration', 'anomaly_count']
-        # 确保只包含存在的列，并按指定顺序排列
-        existing_columns = [col for col in desired_column_order if col in top_20_stats.columns]
-        top_20_stats = top_20_stats[existing_columns]
-                
-        # 从df_filtered_traces中提取三项唯一值：pod_name, service_name, node_name
-        trace_unique_dict = {
-            'pod_name': [],
-            'service_name': [],
-            'node_name': []
+        stats = {
+            'node_name': node_name,
+            'service_name': service_name,
+            'parent_pod': parent_pod,
+            'child_pod': child_pod,
+            'operation_name': operation_name,
+            'normal_avg_duration': normal_avg_time,
+            'anomaly_avg_duration': anomaly_avg_duration,
+            'anomaly_count': len(group)
         }
+        combination_stats.append(stats)
+    
+    # 转换为DataFrame并按出现次数排序，取前20个
+    if len(combination_stats) == 0:
+        if status_combinations is None:
+            return None, candidates, None
+        else:
+            return None, candidates, status_combinations.to_csv(index=False)
         
-        # 从child_pod和parent_pod中提取pod_name
-        pod_names = []
-        if 'child_pod' in top_20_stats.columns:
-            pod_names.extend(top_20_stats['child_pod'].dropna().unique().tolist())
-        if 'parent_pod' in top_20_stats.columns:
-            pod_names.extend(top_20_stats['parent_pod'].dropna().unique().tolist())
-        trace_unique_dict['pod_name'] = sorted(list(set([str(name) for name in pod_names if pd.notna(name)])))
-        
-        # 从service_name列提取唯一值
-        if 'service_name' in top_20_stats.columns:
-            service_names = top_20_stats['service_name'].dropna().unique().tolist()
-            trace_unique_dict['service_name'] = sorted(list(set([str(name) for name in service_names if pd.notna(name)])))
-        
-        # 从node_name列提取唯一值
-        if 'node_name' in top_20_stats.columns:
-            node_names = top_20_stats['node_name'].dropna().unique().tolist()
-            trace_unique_dict['node_name'] = sorted(list(set([str(name) for name in node_names if pd.notna(name)])))
-        
-        # 返回CSV格式字符串、三项唯一值字典和status组合统计
-        filtered_traces_csv = top_20_stats.to_csv(index=False)
-        return filtered_traces_csv, trace_unique_dict, status_combinations_csv
-        
-    except Exception as e:
-        print(f"检测trace异常失败: {e}")
-        return "", {}, ""
+    stats_df = pd.DataFrame(combination_stats)
+    
+
+    # 按出现次数排序，取前20个（在添加文字之前排序）
+    top_20_stats = stats_df.sort_values('anomaly_count', ascending=False).head(20)
+    
+    # 重新排列列顺序
+    desired_column_order = ['node_name', 'service_name', 'parent_pod', 'child_pod', 
+                            'operation_name', 'normal_avg_duration', 'anomaly_avg_duration', 'anomaly_count']
+    # 确保只包含存在的列，并按指定顺序排列
+    existing_columns = [col for col in desired_column_order if col in top_20_stats.columns]
+    top_20_stats = top_20_stats[existing_columns]
+    
+    # 从child_pod和parent_pod中提取pod_name
+    pod_names = []
+    if 'child_pod' in top_20_stats.columns:
+        pod_names.extend(top_20_stats['child_pod'].dropna().unique().tolist())
+        if status_combinations is not None:
+            pod_names.extend(status_combinations['child_pod'].dropna().unique().tolist())
+    if 'parent_pod' in top_20_stats.columns:
+        pod_names.extend(top_20_stats['parent_pod'].dropna().unique().tolist())
+        if status_combinations is not None:
+            pod_names.extend(status_combinations['parent_pod'].dropna().unique().tolist())
+    candidates['candidate_pods'] = sorted(list(set([str(name) for name in pod_names if pd.notna(name)])))
+    
+    # 从service_name列提取唯一值
+    service_names = []
+    if 'service_name' in top_20_stats.columns:
+        service_names.extend(top_20_stats['service_name'].dropna().unique().tolist())
+        if status_combinations is not None:
+            service_names.extend(status_combinations['service_name'].dropna().unique().tolist())
+        candidates['candidate_services'] = sorted(list(set([str(name) for name in service_names if pd.notna(name)])))
+    
+    # 从node_name列提取唯一值
+    node_names = []
+    if 'node_name' in top_20_stats.columns:
+        node_names.extend(top_20_stats['node_name'].dropna().unique().tolist())
+        if status_combinations is not None:
+            node_names.extend(status_combinations['node_name'].dropna().unique().tolist())
+        candidates['candidate_nodes'] = sorted(list(set([str(name) for name in node_names if pd.notna(name)])))
+    
+    # 返回CSV格式字符串、三项唯一值字典和status组合统计
+    filtered_traces_csv = top_20_stats.to_csv(index=False)
+    if status_combinations is None:
+        return filtered_traces_csv, candidates, None
+    else:
+        return filtered_traces_csv, candidates, status_combinations.to_csv(index=False)
