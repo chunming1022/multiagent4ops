@@ -16,32 +16,6 @@ model_client = OpenAIChatCompletionClient(
     },
 )
 
-# model_client = OpenAIChatCompletionClient(
-#     model="gemini-2.5-flash",
-#     base_url="https://generativelanguage.googleapis.com/v1beta/openai/",
-#     api_key="AIzaSyAaTQE-qv3mKoL5za2Kmu7lWMfvEZI_qdA",
-#     parallel_tool_calls=False,
-#     model_info={
-#         "vision": False,
-#         "function_calling": True,
-#         "json_output": True,
-#         "family": "unknown",
-#     },
-# )
-
-# model_client = OpenAIChatCompletionClient(
-#     model="qwen3:4b",
-#     base_url="http://localhost:11434/v1",
-#     api_key="",
-#     parallel_tool_calls=False,
-#     model_info={
-#         "vision": False,
-#         "function_calling": True,
-#         "json_output": True,
-#         "family": "unknown",
-#     },
-# )
-
 logs_agent = AssistantAgent(
     name="LogsAgent",
     description="An intelligent agent focused on processing log data.",
@@ -320,3 +294,4 @@ judge_agent = AssistantAgent(
 #     """
 
 # )
+
